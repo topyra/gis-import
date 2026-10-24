@@ -3,139 +3,105 @@ import sys
 import glob
 import numpy as np
 
-def read_asc(filepath):
-    """Read an ESRI ASCII grid file and return header and data."""
+def read_asc_header(filepath):
     with open(filepath, 'r') as f:
         header = {}
         for _ in range(6):
             line = f.readline().strip()
-            if not line:
-                continue
+            if not line: continue
             parts = line.split()
-            if len(parts) != 2:
-                raise ValueError(f"Invalid header line in {filepath}: {line}")
-            key, value = parts
-            try:
-                header[key] = int(value)
-            except ValueError:
-                header[key] = float(value)
-        
-        # Read data
-        data = []
-        for line in f:
-            if line.strip():
-                data.extend(map(float, line.split()))
-        
-        nrows = int(header['nrows'])
-        ncols = int(header['ncols'])
-        if len(data) != nrows * ncols:
-            raise ValueError(f"Data size mismatch in {filepath}: expected {nrows * ncols}, got {len(data)}")
-        
-        data = np.array(data, dtype=np.float32).reshape(nrows, ncols)
-        return header, data
+            key, value = parts[0], parts[1]
+            header[key] = int(value) if value.lstrip('-').isdigit() else float(value)
+        return header
 
 def main(input_dir, output_file):
-    if not os.path.isdir(input_dir):
-        print(f"Error: {input_dir} is not a directory.")
-        sys.exit(1)
-    
-    asc_files = glob.glob(os.path.join(input_dir, '*.asc'))
+    asc_files = sorted(glob.glob(os.path.join(input_dir, '*.asc')))
     if not asc_files:
-        print(f"No .asc files found in {input_dir}.")
-        sys.exit(1)
-    
-    print(f"Found {len(asc_files)} .asc files.")
-    
-    # Read all files
-    tiles = {}
-    first_header = None
+        print("No .asc files found.")
+        return
+
+    # 1. Read all headers to find global bounds
+    print(f"Analyzing {len(asc_files)} files...")
+    headers = []
     for f in asc_files:
-        print(f"Reading {os.path.basename(f)}...")
-        header, data = read_asc(f)
-        if first_header is None:
-            first_header = header
+        headers.append(read_asc_header(f))
         
-        # Round coordinates to avoid floating-point matching issues
-        xll = round(header['xllcenter'], 4)
-        yll = round(header['yllcenter'], 4)
-        tiles[(xll, yll)] = (header, data)
+    cellsize = headers[0]['cellsize']
+    nodata = headers[0]['nodata_value']
     
-    # Get parameters from first header
-    ncols = int(first_header['ncols'])
-    nrows = int(first_header['nrows'])
-    cellsize = first_header['cellsize']
-    nodata = first_header['nodata_value']
+    min_x_center = min(h['xllcenter'] for h in headers)
+    max_x_center = max(h['xllcenter'] + (h['ncols'] - 1) * cellsize for h in headers)
+    min_y_center = min(h['yllcenter'] for h in headers)
+    max_y_center = max(h['yllcenter'] + (h['nrows'] - 1) * cellsize for h in headers)
     
-    tile_width = ncols * cellsize
-    tile_height = nrows * cellsize
+    global_ncols = int(round((max_x_center - min_x_center) / cellsize)) + 1
+    global_nrows = int(round((max_y_center - min_y_center) / cellsize)) + 1
     
-    # Find bounding box
-    xlls = [coord[0] for coord in tiles.keys()]
-    ylls = [coord[1] for coord in tiles.keys()]
+    print(f"Global Grid Size: {global_ncols} cols x {global_nrows} rows")
     
-    min_xll = min(xlls)
-    max_xll = max(xlls)
-    min_yll = min(ylls)
-    max_yll = max(ylls)
+    # 2. Initialize global canvas
+    # We use float64 to safely accumulate sums for averaging overlapping areas
+    global_sum = np.zeros((global_nrows, global_ncols), dtype=np.float64)
+    global_count = np.zeros((global_nrows, global_ncols), dtype=np.int32)
     
-    # Calculate grid dimensions
-    num_tiles_x = int(round((max_xll - min_xll) / tile_width)) + 1
-    num_tiles_y = int(round((max_yll - min_yll) / tile_height)) + 1
+    # 3. Load and paste each tile
+    for f, h in zip(asc_files, headers):
+        print(f"Processing {os.path.basename(f)}...")
+        
+        # Read data
+        with open(f, 'r') as fp:
+            for _ in range(6): fp.readline()
+            data = []
+            for line in fp:
+                if line.strip():
+                    data.extend(map(float, line.split()))
+        
+        tile_data = np.array(data, dtype=np.float32).reshape(h['nrows'], h['ncols'])
+        
+        # Calculate tile position on global canvas
+        col_start = int(round((h['xllcenter'] - min_x_center) / cellsize))
+        row_start = int(round((max_y_center - (h['yllcenter'] + (h['nrows'] - 1) * cellsize)) / cellsize))
+        
+        # Create mask of valid data
+        mask = tile_data != nodata
+        
+        # Add valid data to global sum and increment count
+        global_sum[row_start:row_start+h['nrows'], col_start:col_start+h['ncols']][mask] += tile_data[mask]
+        global_count[row_start:row_start+h['nrows'], col_start:col_start+h['ncols']][mask] += 1
+        
+    # 4. Calculate average for overlapping areas
+    print("Calculating averages for overlapping regions...")
+    merged_data = np.full((global_nrows, global_ncols), nodata, dtype=np.float32)
     
-    print(f"Grid size: {num_tiles_x} x {num_tiles_y} tiles")
-    print(f"Total size: {num_tiles_x * ncols} x {num_tiles_y * nrows} cells")
+    valid_mask = global_count > 0
+    merged_data[valid_mask] = global_sum[valid_mask] / global_count[valid_mask]
     
-    # Generate expected coordinates
-    expected_xlls = [round(min_xll + i * tile_width, 4) for i in range(num_tiles_x)]
-    expected_ylls = [round(min_yll + i * tile_height, 4) for i in range(num_tiles_y)]
+    overlap_pixels = np.sum(global_count > 1)
+    print(f"Found {overlap_pixels} overlapping pixels that were seamlessly averaged.")
     
-    # Create merged grid filled with nodata
-    total_ncols = num_tiles_x * ncols
-    total_nrows = num_tiles_y * nrows
-    merged_data = np.full((total_nrows, total_ncols), nodata, dtype=np.float32)
-    
-    # Fill in tiles
-    filled_count = 0
-    for i, xll in enumerate(expected_xlls):
-        for j, yll in enumerate(expected_ylls):
-            # j=0 is min_yll (bottom), map to bottom rows in output
-            row_idx = (num_tiles_y - 1 - j) * nrows
-            col_idx = i * ncols
-            
-            if (xll, yll) in tiles:
-                _, data = tiles[(xll, yll)]
-                merged_data[row_idx:row_idx + nrows, col_idx:col_idx + ncols] = data
-                filled_count += 1
-    
-    print(f"Filled {filled_count} out of {num_tiles_x * num_tiles_y} tiles.")
-    
-    # Write output
-    print(f"Writing output to {output_file}...")
+    # 5. Write output
+    print(f"Writing to {output_file}...")
     with open(output_file, 'w') as f:
-        f.write(f"ncols {total_ncols}\n")
-        f.write(f"nrows {total_nrows}\n")
-        f.write(f"xllcenter {min_xll}\n")
-        f.write(f"yllcenter {min_yll}\n")
+        f.write(f"ncols {global_ncols}\n")
+        f.write(f"nrows {global_nrows}\n")
+        f.write(f"xllcenter {min_x_center}\n")
+        f.write(f"yllcenter {min_y_center}\n")
         f.write(f"cellsize {cellsize}\n")
-        f.write(f"nodata_value {nodata}\n")
+        f.write(f"nodata_value {int(nodata) if nodata == int(nodata) else nodata}\n")
         
-        # Write data with appropriate formatting
-        for row in merged_data:
-            formatted = []
-            for val in row:
+        for r in range(global_nrows):
+            row_str = []
+            for val in merged_data[r]:
                 if val == nodata:
-                    formatted.append(str(int(nodata)))
+                    row_str.append(str(int(nodata)) if nodata == int(nodata) else str(nodata))
                 else:
-                    formatted.append(f"{val:.2f}")
-            f.write(' '.join(formatted) + '\n')
-    
-    print("Done.")
+                    row_str.append(f"{val:.2f}")
+            f.write(" ".join(row_str) + "\n")
+            
+    print("Done!")
 
 if __name__ == '__main__':
     if len(sys.argv) != 3:
-        print("Usage: python merge_asc.py <input_dir> <output_file>")
+        print("Usage: python esri_asc_merge.py <input_dir> <output_file.asc>")
         sys.exit(1)
-    
-    input_dir = sys.argv[1]
-    output_file = sys.argv[2]
-    main(input_dir, output_file)
+    main(sys.argv[1], sys.argv[2])
